@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from solidlsp.language_servers.csharp_language_server import find_nearest_ancestor_dir, find_project_files_under
+from solidlsp.language_servers.csharp_language_server import (
+    find_nearest_ancestor_dir,
+    find_nested_repository_root,
+    find_project_files_under,
+)
 from solidlsp.ls_config import LanguageServerId
 from test.conftest import get_repo_path, start_ls_context
 
@@ -90,3 +94,41 @@ def test_worktree_copy_with_identical_project_names_stays_separate(tmp_path: Pat
 
         # second call takes the already-loaded fast path
         assert ls.request_references(worktree_program, 22, 20)
+
+
+def test_find_nested_repository_root(tmp_path: Path) -> None:
+    worktree = _add_worktree(tmp_path)
+    (worktree / ".git").write_text("gitdir: elsewhere\n")
+    (tmp_path / ".git").mkdir()
+    file_path = str(worktree / "WorktreeOnly.cs")
+
+    assert find_nested_repository_root(file_path, str(tmp_path)) == str(worktree)
+    assert find_nested_repository_root(str(tmp_path / "Loose.cs"), str(tmp_path)) is None
+
+
+@pytest.mark.csharp
+def test_references_span_projects_of_a_worktree_without_top_level_solution(tmp_path: Path) -> None:
+    """A worktree whose solution sits in a sub-folder still gets all its projects loaded."""
+    repo_root = tmp_path / "repo"
+    shutil.copytree(get_repo_path(LanguageServerId.CSHARP), repo_root, ignore=shutil.ignore_patterns("bin", "obj"))
+    worktree = repo_root / ".worktrees" / "legacy"
+    (worktree / "Lib").mkdir(parents=True)
+    (worktree / "App").mkdir()
+    (worktree / "Solutions").mkdir()
+    (worktree / ".git").write_text("gitdir: elsewhere\n")
+    (worktree / "Lib" / "Lib.csproj").write_text(_CSPROJ)
+    (worktree / "Lib" / "Shared.cs").write_text("public class Shared\n{\n    public int Value() => 1;\n}\n")
+    (worktree / "App" / "App.csproj").write_text(
+        _CSPROJ.replace("</Project>", '  <ItemGroup><ProjectReference Include="../Lib/Lib.csproj" /></ItemGroup>\n</Project>')
+    )
+    (worktree / "App" / "Consumer.cs").write_text("public class Consumer\n{\n    public int Use() => new Shared().Value();\n}\n")
+    (worktree / "Solutions" / "Legacy.slnx").write_text(
+        '<Solution>\n  <Project Path="../Lib/Lib.csproj" />\n  <Project Path="../App/App.csproj" />\n</Solution>\n'
+    )
+
+    with start_ls_context(LanguageServerId.CSHARP, repo_path=str(repo_root), solidlsp_dir=tmp_path / "solidlsp") as ls:
+        # line 2 = "    public int Value() => 1;", column 15 = "Value"
+        references = ls.request_references(os.path.join(".worktrees", "legacy", "Lib", "Shared.cs"), 2, 15)
+
+        ref_paths = {os.path.basename(ref["absolutePath"]) for ref in references}
+        assert "Consumer.cs" in ref_paths, f"expected a reference from the sibling project, got {references}"
