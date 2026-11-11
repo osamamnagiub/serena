@@ -7,7 +7,8 @@ import os
 import platform
 import shutil
 import threading
-from collections.abc import Hashable, Iterable
+from collections.abc import Hashable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -157,6 +158,41 @@ def breadth_first_file_scan(root_dir: str) -> Iterable[str]:
             pass
 
 
+_PROJECT_SCAN_SKIPPED_DIRNAMES = {"bin", "obj", "node_modules"}
+
+
+def find_project_files_under(root_dir: str) -> list[str]:
+    """
+    Find all .csproj files under root_dir, skipping dot-directories and build output directories.
+    """
+    project_files: list[str] = []
+    for current_dir, dirnames, filenames in os.walk(root_dir):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in _PROJECT_SCAN_SKIPPED_DIRNAMES]
+        project_files.extend(os.path.join(current_dir, f) for f in filenames if f.endswith(".csproj"))
+    return sorted(project_files)
+
+
+def find_nearest_ancestor_dir(file_path: str, root_dir: str, extensions: tuple[str, ...], include_root: bool) -> str | None:
+    """
+    Walk up from the directory of file_path towards root_dir and return the first directory
+    containing a file with one of the given extensions; None if root_dir is reached (or left).
+    """
+    current_dir = os.path.dirname(file_path)
+    while True:
+        is_root = current_dir == root_dir
+        if is_root and not include_root:
+            return None
+        try:
+            if any(f.endswith(extensions) for f in os.listdir(current_dir)):
+                return current_dir
+        except OSError:
+            pass
+        parent = os.path.dirname(current_dir)
+        if is_root or parent == current_dir or not current_dir.startswith(root_dir + os.sep):
+            return None
+        current_dir = parent
+
+
 def find_solution_or_project_file(root_dir: str) -> str | None:
     """
     Find the first .sln or .slnx file in breadth-first order.
@@ -219,6 +255,10 @@ class CSharpLanguageServer(SolidLanguageServer):
         # Cache for original Roslyn symbol names with type annotations
         # Key: (relative_file_path, line, character) -> Value: original name
         self._original_symbol_names: dict[tuple[str, int, int], str] = {}
+        # Real paths of the .csproj files sent to the server via project/open (or solution/open).
+        self._opened_project_files: set[str] = set()
+        self._project_open_lock = threading.Lock()
+        self._project_load_complete = threading.Event()
 
     def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
         return self.DependencyProvider(self._custom_settings, self._ls_resources_dir, self._solidlsp_settings, self.repository_root_path)
@@ -646,6 +686,7 @@ class CSharpLanguageServer(SolidLanguageServer):
 
         def handle_workspace_indexing_complete(params: dict) -> None:
             indexing_complete.set()
+            self._project_load_complete.set()
 
         # Set up notification handlers
         self.server.on_notification("window/logMessage", window_log_message)
@@ -757,6 +798,47 @@ class CSharpLanguageServer(SolidLanguageServer):
             project_uris = [PathUtils.path_to_uri(project_file) for project_file in project_files]
             self.server.notify.send_notification("project/open", {"projects": project_uris})
             log.debug(f"Opened project files: {project_files}")
+            self._opened_project_files.update(os.path.realpath(p) for p in project_files)
+
+    def _ensure_containing_projects_open(self, relative_file_path: str) -> None:
+        """
+        The startup scan skips dot-directories, so projects of a nested solution such as a git worktree
+        (e.g. <root>/.worktrees/x/repo/Repo.sln) are never loaded. When a file's owning project was not
+        opened, open all projects of the nearest solution containing it and wait for them to load.
+        """
+        root = os.path.realpath(self.repository_root_path)
+        file_path = os.path.realpath(os.path.join(root, relative_file_path))
+        if not file_path.startswith(root + os.sep):
+            return
+
+        project_dir = find_nearest_ancestor_dir(file_path, root, (".csproj",), include_root=True)
+        if project_dir is None:
+            return
+        project_files = {os.path.realpath(os.path.join(project_dir, f)) for f in os.listdir(project_dir) if f.endswith(".csproj")}
+        if project_files <= self._opened_project_files:
+            return
+
+        with self._project_open_lock:
+            if project_files <= self._opened_project_files:
+                return
+            solution_dir = find_nearest_ancestor_dir(file_path, root, (".sln", ".slnx"), include_root=False)
+            scope_dir = solution_dir or project_dir
+            scope_project_files = {os.path.realpath(p) for p in find_project_files_under(scope_dir)}
+            new_project_files = sorted((scope_project_files | project_files) - self._opened_project_files)
+            log.info(f"Opening {len(new_project_files)} project(s) under {scope_dir} for {relative_file_path}")
+            self._project_load_complete.clear()
+            self.server.notify.send_notification("project/open", {"projects": [PathUtils.path_to_uri(p) for p in new_project_files]})
+            self._opened_project_files.update(new_project_files)
+            if not self._project_load_complete.wait(120):
+                log.warning(f"Timeout waiting for projects under {scope_dir} to load, proceeding anyway")
+
+    @contextmanager
+    @override
+    def open_file(self, relative_file_path: str, open_in_ls: bool = True) -> Iterator[LSPFileBuffer]:
+        if self.server_started:
+            self._ensure_containing_projects_open(relative_file_path)
+        with super().open_file(relative_file_path, open_in_ls) as file_buffer:
+            yield file_buffer
 
     @override
     def _get_wait_time_for_cross_file_referencing(self) -> float:
