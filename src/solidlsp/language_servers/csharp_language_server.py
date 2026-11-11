@@ -205,6 +205,19 @@ def find_nearest_ancestor_dir(file_path: str, root_dir: str, extensions: tuple[s
         current_dir = parent
 
 
+def find_nested_repository_root(file_path: str, root_dir: str) -> str | None:
+    """
+    Return the nearest directory above file_path, strictly below root_dir, that is a git repository or
+    worktree root (contains a `.git` entry); None if there is none.
+    """
+    current_dir = os.path.dirname(file_path)
+    while current_dir != root_dir and current_dir.startswith(root_dir + os.sep):
+        if os.path.exists(os.path.join(current_dir, ".git")):
+            return current_dir
+        current_dir = os.path.dirname(current_dir)
+    return None
+
+
 def find_solution_or_project_file(root_dir: str) -> str | None:
     """
     Find the first .sln or .slnx file in breadth-first order.
@@ -859,7 +872,7 @@ class CSharpLanguageServer(SolidLanguageServer):
         """
         The startup scan skips dot-directories, so projects of a nested solution such as a git worktree
         (e.g. <root>/.worktrees/x/repo/Repo.sln) are never loaded. When a file's owning project was not
-        opened, open all projects of the nearest solution containing it and wait until the server
+        opened, open all projects of the nested repository/worktree (or else the nearest solution) containing it and wait until the server
         reports each of them loaded.
         """
         root = os.path.realpath(self.repository_root_path)
@@ -873,8 +886,13 @@ class CSharpLanguageServer(SolidLanguageServer):
         with self._project_states_changed:
             waiting_for = set(owning)
             if any(p not in self._project_states for p in owning):
-                solution_dir = find_nearest_ancestor_dir(file_path, root, (".sln", ".slnx"), include_root=False)
-                scope_dir = solution_dir or os.path.dirname(next(iter(owning)))
+                # Prefer the whole nested repository/worktree: repos such as legacy .NET Framework ones may
+                # have no top-level solution, and their projects reference each other across solutions.
+                scope_dir = (
+                    find_nested_repository_root(file_path, root)
+                    or find_nearest_ancestor_dir(file_path, root, (".sln", ".slnx"), include_root=False)
+                    or os.path.dirname(next(iter(owning)))
+                )
                 scope_project_files = {os.path.realpath(p) for p in find_project_files_under(scope_dir)}
                 new_project_files = sorted((scope_project_files | owning) - self._project_states.keys())
                 log.info(f"Opening {len(new_project_files)} project(s) under {scope_dir} for {relative_file_path}")
