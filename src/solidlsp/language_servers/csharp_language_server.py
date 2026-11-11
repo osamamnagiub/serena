@@ -6,10 +6,12 @@ CSharp Language Server using Roslyn Language Server (Official Roslyn-based LSP s
 import logging
 import os
 import platform
+import re
 import shutil
 import tempfile
 import threading
-from collections.abc import Callable, Hashable, Iterable, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -168,6 +170,41 @@ def breadth_first_file_scan(root_dir: str, is_ignored_path: Callable[[str], bool
             pass
 
 
+_PROJECT_SCAN_SKIPPED_DIRNAMES = {"bin", "obj", "node_modules"}
+
+
+def find_project_files_under(root_dir: str) -> list[str]:
+    """
+    Find all .csproj files under root_dir, skipping dot-directories and build output directories.
+    """
+    project_files: list[str] = []
+    for current_dir, dirnames, filenames in os.walk(root_dir):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in _PROJECT_SCAN_SKIPPED_DIRNAMES]
+        project_files.extend(os.path.join(current_dir, f) for f in filenames if f.endswith(".csproj"))
+    return sorted(project_files)
+
+
+def find_nearest_ancestor_dir(file_path: str, root_dir: str, extensions: tuple[str, ...], include_root: bool) -> str | None:
+    """
+    Walk up from the directory of file_path towards root_dir and return the first directory
+    containing a file with one of the given extensions; None if root_dir is reached (or left).
+    """
+    current_dir = os.path.dirname(file_path)
+    while True:
+        is_root = current_dir == root_dir
+        if is_root and not include_root:
+            return None
+        try:
+            if any(f.endswith(extensions) for f in os.listdir(current_dir)):
+                return current_dir
+        except OSError:
+            pass
+        parent = os.path.dirname(current_dir)
+        if is_root or parent == current_dir or not current_dir.startswith(root_dir + os.sep):
+            return None
+        current_dir = parent
+
+
 def find_solution_or_project_file(root_dir: str) -> str | None:
     """
     Find the first .sln or .slnx file in breadth-first order.
@@ -233,6 +270,12 @@ class CSharpLanguageServer(SolidLanguageServer):
         # Set once Roslyn confirms it finished (re)loading the solution/projects; reused by
         # notify_files_created to wait out a reload triggered after startup.
         self._project_reload_complete = threading.Event()
+        # Load state of every .csproj sent via project/open, keyed by real path: "pending" until the
+        # server logs that it finished (or failed) loading it, then "loaded".
+        self._project_states: dict[str, str] = {}
+        self._project_states_changed = threading.Condition()
+        # Real path of a source file's directory -> real paths of the .csproj files owning it.
+        self._owning_projects_cache: dict[str, frozenset[str]] = {}
 
     def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
         return self.DependencyProvider(self._custom_settings, self._ls_resources_dir, self._solidlsp_settings, self.repository_root_path)
@@ -562,6 +605,7 @@ class CSharpLanguageServer(SolidLanguageServer):
             level_map = {1: logging.ERROR, 2: logging.WARNING, 3: logging.INFO, 4: logging.DEBUG}  # Error  # Warning  # Info  # Log
 
             log.log(level_map.get(level, logging.DEBUG), f"LSP: {message_text}")
+            self._record_project_load_result(message_text)
 
             # workspace/projectInitializationComplete (below) fires too early on a project
             # *re*-open to signal reload completion; this log line is the reliable one for
@@ -784,6 +828,77 @@ class CSharpLanguageServer(SolidLanguageServer):
             project_uris = [PathUtils.path_to_uri(project_file) for project_file in project_files]
             self.server.notify.send_notification("project/open", {"projects": project_uris})
             log.debug(f"Opened project files: {project_files}")
+            with self._project_states_changed:
+                self._project_states.update((os.path.realpath(p), "loaded") for p in project_files)
+
+    # Roslyn reports a finished project load with exactly one of these: a success line, or (instead of
+    # it) the warnings/errors produced by the load.
+    _PROJECT_LOAD_RESULT_PATTERN = re.compile(r"(?:Successfully completed load of|Warning while loading|Error while loading) (.+?\.csproj)")
+
+    def _record_project_load_result(self, message_text: str) -> None:
+        match = self._PROJECT_LOAD_RESULT_PATTERN.search(message_text)
+        if match is None:
+            return
+        with self._project_states_changed:
+            self._project_states[os.path.realpath(match.group(1))] = "loaded"
+            self._project_states_changed.notify_all()
+
+    def _owning_projects(self, file_path: str, root: str) -> frozenset[str]:
+        file_dir = os.path.dirname(file_path)
+        cached = self._owning_projects_cache.get(file_dir)
+        if cached is not None:
+            return cached
+        project_dir = find_nearest_ancestor_dir(file_path, root, (".csproj",), include_root=True)
+        owning: frozenset[str] = frozenset()
+        if project_dir is not None:
+            owning = frozenset(os.path.realpath(os.path.join(project_dir, f)) for f in os.listdir(project_dir) if f.endswith(".csproj"))
+        self._owning_projects_cache[file_dir] = owning
+        return owning
+
+    def _ensure_containing_projects_open(self, relative_file_path: str) -> None:
+        """
+        The startup scan skips dot-directories, so projects of a nested solution such as a git worktree
+        (e.g. <root>/.worktrees/x/repo/Repo.sln) are never loaded. When a file's owning project was not
+        opened, open all projects of the nearest solution containing it and wait until the server
+        reports each of them loaded.
+        """
+        root = os.path.realpath(self.repository_root_path)
+        file_path = os.path.realpath(os.path.join(root, relative_file_path))
+        if not file_path.startswith(root + os.sep):
+            return
+        owning = self._owning_projects(file_path, root)
+        if all(self._project_states.get(p) == "loaded" for p in owning):
+            return
+
+        with self._project_states_changed:
+            waiting_for = set(owning)
+            if any(p not in self._project_states for p in owning):
+                solution_dir = find_nearest_ancestor_dir(file_path, root, (".sln", ".slnx"), include_root=False)
+                scope_dir = solution_dir or os.path.dirname(next(iter(owning)))
+                scope_project_files = {os.path.realpath(p) for p in find_project_files_under(scope_dir)}
+                new_project_files = sorted((scope_project_files | owning) - self._project_states.keys())
+                log.info(f"Opening {len(new_project_files)} project(s) under {scope_dir} for {relative_file_path}")
+                self._project_states.update((p, "pending") for p in new_project_files)
+                self.server.notify.send_notification("project/open", {"projects": [PathUtils.path_to_uri(p) for p in new_project_files]})
+                waiting_for.update(new_project_files)
+
+            def all_loaded() -> bool:
+                return all(self._project_states.get(p) == "loaded" for p in waiting_for)
+
+            if not self._project_states_changed.wait_for(all_loaded, timeout=120):
+                stuck = [p for p in waiting_for if self._project_states.get(p) == "pending"]
+                log.warning(f"Timeout waiting for {len(stuck)} project(s) to load, proceeding anyway: {stuck}")
+                # Forget them so a later request opens them again.
+                for p in stuck:
+                    self._project_states.pop(p, None)
+
+    @contextmanager
+    @override
+    def open_file(self, relative_file_path: str, open_in_ls: bool = True) -> Iterator[LSPFileBuffer]:
+        if self.server_started:
+            self._ensure_containing_projects_open(relative_file_path)
+        with super().open_file(relative_file_path, open_in_ls) as file_buffer:
+            yield file_buffer
 
     @override
     def _get_wait_time_for_cross_file_referencing(self) -> float:
