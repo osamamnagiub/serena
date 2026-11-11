@@ -5,6 +5,7 @@ CSharp Language Server using Roslyn Language Server (Official Roslyn-based LSP s
 import logging
 import os
 import platform
+import re
 import shutil
 import threading
 from collections.abc import Hashable, Iterable, Iterator
@@ -255,10 +256,12 @@ class CSharpLanguageServer(SolidLanguageServer):
         # Cache for original Roslyn symbol names with type annotations
         # Key: (relative_file_path, line, character) -> Value: original name
         self._original_symbol_names: dict[tuple[str, int, int], str] = {}
-        # Real paths of the .csproj files sent to the server via project/open (or solution/open).
-        self._opened_project_files: set[str] = set()
-        self._project_open_lock = threading.Lock()
-        self._project_load_complete = threading.Event()
+        # Load state of every .csproj sent via project/open, keyed by real path: "pending" until the
+        # server logs that it finished (or failed) loading it, then "loaded".
+        self._project_states: dict[str, str] = {}
+        self._project_states_changed = threading.Condition()
+        # Real path of a source file's directory -> real paths of the .csproj files owning it.
+        self._owning_projects_cache: dict[str, frozenset[str]] = {}
 
     def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
         return self.DependencyProvider(self._custom_settings, self._ls_resources_dir, self._solidlsp_settings, self.repository_root_path)
@@ -590,6 +593,7 @@ class CSharpLanguageServer(SolidLanguageServer):
             level_map = {1: logging.ERROR, 2: logging.WARNING, 3: logging.INFO, 4: logging.DEBUG}  # Error  # Warning  # Info  # Log
 
             log.log(level_map.get(level, logging.DEBUG), f"LSP: {message_text}")
+            self._record_project_load_result(message_text)
 
         def handle_progress(params: dict) -> None:
             """Handle progress notifications from the language server."""
@@ -686,7 +690,6 @@ class CSharpLanguageServer(SolidLanguageServer):
 
         def handle_workspace_indexing_complete(params: dict) -> None:
             indexing_complete.set()
-            self._project_load_complete.set()
 
         # Set up notification handlers
         self.server.on_notification("window/logMessage", window_log_message)
@@ -798,39 +801,69 @@ class CSharpLanguageServer(SolidLanguageServer):
             project_uris = [PathUtils.path_to_uri(project_file) for project_file in project_files]
             self.server.notify.send_notification("project/open", {"projects": project_uris})
             log.debug(f"Opened project files: {project_files}")
-            self._opened_project_files.update(os.path.realpath(p) for p in project_files)
+            with self._project_states_changed:
+                self._project_states.update((os.path.realpath(p), "loaded") for p in project_files)
+
+    # Roslyn reports a finished project load with exactly one of these: a success line, or (instead of
+    # it) the warnings/errors produced by the load.
+    _PROJECT_LOAD_RESULT_PATTERN = re.compile(r"(?:Successfully completed load of|Warning while loading|Error while loading) (.+?\.csproj)")
+
+    def _record_project_load_result(self, message_text: str) -> None:
+        match = self._PROJECT_LOAD_RESULT_PATTERN.search(message_text)
+        if match is None:
+            return
+        with self._project_states_changed:
+            self._project_states[os.path.realpath(match.group(1))] = "loaded"
+            self._project_states_changed.notify_all()
+
+    def _owning_projects(self, file_path: str, root: str) -> frozenset[str]:
+        file_dir = os.path.dirname(file_path)
+        cached = self._owning_projects_cache.get(file_dir)
+        if cached is not None:
+            return cached
+        project_dir = find_nearest_ancestor_dir(file_path, root, (".csproj",), include_root=True)
+        owning: frozenset[str] = frozenset()
+        if project_dir is not None:
+            owning = frozenset(os.path.realpath(os.path.join(project_dir, f)) for f in os.listdir(project_dir) if f.endswith(".csproj"))
+        self._owning_projects_cache[file_dir] = owning
+        return owning
 
     def _ensure_containing_projects_open(self, relative_file_path: str) -> None:
         """
         The startup scan skips dot-directories, so projects of a nested solution such as a git worktree
         (e.g. <root>/.worktrees/x/repo/Repo.sln) are never loaded. When a file's owning project was not
-        opened, open all projects of the nearest solution containing it and wait for them to load.
+        opened, open all projects of the nearest solution containing it and wait until the server
+        reports each of them loaded.
         """
         root = os.path.realpath(self.repository_root_path)
         file_path = os.path.realpath(os.path.join(root, relative_file_path))
         if not file_path.startswith(root + os.sep):
             return
-
-        project_dir = find_nearest_ancestor_dir(file_path, root, (".csproj",), include_root=True)
-        if project_dir is None:
-            return
-        project_files = {os.path.realpath(os.path.join(project_dir, f)) for f in os.listdir(project_dir) if f.endswith(".csproj")}
-        if project_files <= self._opened_project_files:
+        owning = self._owning_projects(file_path, root)
+        if all(self._project_states.get(p) == "loaded" for p in owning):
             return
 
-        with self._project_open_lock:
-            if project_files <= self._opened_project_files:
-                return
-            solution_dir = find_nearest_ancestor_dir(file_path, root, (".sln", ".slnx"), include_root=False)
-            scope_dir = solution_dir or project_dir
-            scope_project_files = {os.path.realpath(p) for p in find_project_files_under(scope_dir)}
-            new_project_files = sorted((scope_project_files | project_files) - self._opened_project_files)
-            log.info(f"Opening {len(new_project_files)} project(s) under {scope_dir} for {relative_file_path}")
-            self._project_load_complete.clear()
-            self.server.notify.send_notification("project/open", {"projects": [PathUtils.path_to_uri(p) for p in new_project_files]})
-            self._opened_project_files.update(new_project_files)
-            if not self._project_load_complete.wait(120):
-                log.warning(f"Timeout waiting for projects under {scope_dir} to load, proceeding anyway")
+        with self._project_states_changed:
+            waiting_for = set(owning)
+            if any(p not in self._project_states for p in owning):
+                solution_dir = find_nearest_ancestor_dir(file_path, root, (".sln", ".slnx"), include_root=False)
+                scope_dir = solution_dir or os.path.dirname(next(iter(owning)))
+                scope_project_files = {os.path.realpath(p) for p in find_project_files_under(scope_dir)}
+                new_project_files = sorted((scope_project_files | owning) - self._project_states.keys())
+                log.info(f"Opening {len(new_project_files)} project(s) under {scope_dir} for {relative_file_path}")
+                self._project_states.update((p, "pending") for p in new_project_files)
+                self.server.notify.send_notification("project/open", {"projects": [PathUtils.path_to_uri(p) for p in new_project_files]})
+                waiting_for.update(new_project_files)
+
+            def all_loaded() -> bool:
+                return all(self._project_states.get(p) == "loaded" for p in waiting_for)
+
+            if not self._project_states_changed.wait_for(all_loaded, timeout=120):
+                stuck = [p for p in waiting_for if self._project_states.get(p) == "pending"]
+                log.warning(f"Timeout waiting for {len(stuck)} project(s) to load, proceeding anyway: {stuck}")
+                # Forget them so a later request opens them again.
+                for p in stuck:
+                    self._project_states.pop(p, None)
 
     @contextmanager
     @override

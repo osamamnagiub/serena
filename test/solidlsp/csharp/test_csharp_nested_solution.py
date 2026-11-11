@@ -67,3 +67,26 @@ def test_references_resolve_inside_nested_worktree_solution(tmp_path: Path) -> N
 
         ref_paths = {os.path.basename(ref["absolutePath"]) for ref in references}
         assert "WorktreeUser.cs" in ref_paths, f"expected a reference from the worktree project, got {references}"
+
+
+@pytest.mark.csharp
+def test_worktree_copy_with_identical_project_names_stays_separate(tmp_path: Path) -> None:
+    """A worktree holding a copy of the root repo (same project/assembly names) resolves within itself."""
+    repo_root = tmp_path / "repo"
+    shutil.copytree(get_repo_path(Language.CSHARP), repo_root, ignore=shutil.ignore_patterns("bin", "obj"))
+    worktree = repo_root / ".worktrees" / "copy"
+    shutil.copytree(repo_root, worktree, ignore=shutil.ignore_patterns("bin", "obj", ".worktrees"))
+
+    with start_ls_context(Language.CSHARP, repo_path=str(repo_root), solidlsp_dir=tmp_path / "solidlsp") as ls:
+        worktree_program = os.path.join(".worktrees", "copy", "Program.cs")
+        # line 22 = "        public int Add(int a, int b)", column 20 = "Add"
+        references = ls.request_references(worktree_program, 22, 20)
+        assert references, "expected references inside the worktree copy"
+        assert all(".worktrees" in ref["absolutePath"] for ref in references), references
+
+        main_references = ls.request_references("Program.cs", 22, 20)
+        assert main_references, "expected references in the root repo"
+        assert not any(".worktrees" in ref["absolutePath"] for ref in main_references), main_references
+
+        # second call takes the already-loaded fast path
+        assert ls.request_references(worktree_program, 22, 20)
